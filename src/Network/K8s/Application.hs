@@ -23,6 +23,11 @@
 -- @
 -- ...
 -- spec:
+--   metadata:
+--     annotations:
+--       prometheus.io/port: "9121"
+--       prometheus.io/scrape: "true"
+--       prometheus.io\/path: "\/_metrics"
 --   containers:
 --     - lifecycle:
 --         preStop:
@@ -66,23 +71,23 @@
 --          periodSeconds: 10
 --          successThreshold: 1
 --          timeoutSeconds: 2
---
 -- @
 --
--- Examples
-module Network.K8s 
+module Network.K8s.Application
   ( withK8sEndpoint
   , Config(..)
+  , defConfig
     -- * Checks
     -- $k8s-checks
   , K8sChecks(..)
   ) where
 
+import Control.Concurrent (killThread, threadDelay, forkIO)
 import Control.Concurrent.Async
 import Control.Concurrent.STM
+import Control.Exception (finally, AsyncException, throwIO, fromException)
 import Control.Monad
 import Data.Foldable
-import Data.Text qualified as T
 import Network.HTTP.Types
 import Network.Wai as Wai
 import Network.Wai.Handler.Warp qualified             as Warp
@@ -146,6 +151,26 @@ data ApplicationState
 
 -- | Wrap a server that allows controlling business logic server. The server can be
 -- communicated by the k8s services and can monitor the application livecycle.
+--
+-- In the application run the following logic:
+--
+-- @
+--    k8s_wrapper_server                  user code
+--                                   +----------------+
+--        ready=false                | initialization |             
+--        started=false              |                |
+--        alive=false                +----------------+
+--                                          |
+--        started=true  <-------------------+
+--                                          |
+--                                   +---------------+
+--                                   | start server  |
+--                                   +---------------+
+--                                          |
+--       ready? ---> check user thread, run callback
+--       alive? ---> check user thread, run callback
+-- @
+--             
 -- 
 -- In addition to the callbacks that the server is running it provides some additional
 -- logic:
@@ -157,57 +182,116 @@ data ApplicationState
 --      check, and once it was asked by the server it sends an Exception to the client
 --      code. It ensures that no new requests will be sent to the server.
 --
+-- In case of asynchronous exception, we expect that we want to terminate the program,
+-- so we want to ensure the similar set of actions as call to /stop hook:
+--
+--   1. We put application in the tearingdown state
+--   2. We start replying with ready=false replies
+--   3. Once we replies with ready=false once (or after a timeout) we trigger server stop.
+--      In this place we expect the server to stop accepting new connections, and exit
+--      once all current connections will be processed. This is the responcibility of the
+--      function provided by the user, but servers like Warp already handles that properly. 
+--
+-- In case of an exception in the initialization function it will be rethrown, code
+-- the function will exit with the same exception, k8s endpoint will be teared down.
+--
+-- In case if the user code exists with an exception it will be rethrown, otherwise the
+-- code exits properly.
 withK8sEndpoint
-  :: Config -- ^ Static configuration of the endpoint.
-  -> K8sChecks
-  -> IO a          -- ^ Initialization procedure
-  -> (a -> IO b)   -- ^ User supplied logic, see requirements for the server to work properly.
+  :: Config      -- ^ Static configuration of the endpoint.
+  -> K8sChecks   -- ^ K8s hooks
+  -> IO a        -- ^ Initialization procedure
+  -> (a -> IO b) -- ^ User supplied logic, see requirements for the server to work properly.
   -> IO ()
-withK8sEndpoint Config{..} K8sChecks{..} startup action = do
+withK8sEndpoint Config{..} k8s startup action = do
   startup_handle <- async startup
   state_box <- atomically $ newTVar $ ApplicationStarting (fmap (const ()) startup_handle)
-  withAsync (wait startup_handle >>= \x -> atomically (switchToRunning state_box) >> action x) $ \server -> race_ 
-    -- wait while the user application will exit on it's own.
-    (wait server) 
-    -- run the server
-    $ Warp.run port
-    $ \req resp -> do
-       case Wai.pathInfo req of
-         ["started"] -> do
-           readTVarIO state_box >>= \case
-             ApplicationStarting{} ->
-               resp $ responseLBS status400 [(hContentType, "text/plain")] "starting"
-             ApplicationRunning{} ->
-               resp $ responseLBS status200 [(hContentType, "text/plain")] "ok"
-             _ -> 
-               resp $ responseLBS status200 [(hContentType, "text/plain")] "tearing down"
-         ["ready"] -> do
-           readTVarIO state_box >>= \case
-             ApplicationStarting{} -> 
-               resp $ responseLBS status400 [(hContentType, "text/plain")] "starting"
-             ApplicationRunning{} -> do
-               isReady   <- runReadynessCheck
-               if isReady
-               then resp $ responseLBS status200 [(hContentType, "text/plain")] "ok"
-               else resp $ responseLBS status400 [(hContentType, "text/plain")] "not running"
-             ApplicationTeardownConfirm confirmed -> do
-               atomically $ writeTVar confirmed True
-               resp $ responseLBS status400 [(hContentType, "text/plain")] "tearing down"
-             ApplicationTearingDown{} ->
-               resp $ responseLBS status400 [(hContentType, "text/plain")] "tearing down"
-         ["health"] -> do
-           isAlive <- runLivenessCheck 
-           if isAlive
-           then resp $ responseLBS status200 [(hContentType, "text/plain")] "ok"
-           else resp $ responseLBS status400 [(hContentType, "text/plain")] "starting"
-         ["stop"]  -> do
-           d <- registerDelay (maxTearDownPeriodSeconds * 1_000_000)
-           join $ atomically $ switchToTeardown d state_box
-           cancel server
-           resp $ responseLBS status200 [(hContentType, "text/plain")] "teardown"
-         ["_metrics"] -> metricsApp req resp
-         -- If it's any other path then we simply return 404
-         _ -> resp $ Wai.responseLBS status404 [(hContentType, "text/plain")] "Not found"
+  -- We start the server in the background, this is done synchronously
+  -- with running initialization procedure.
+  withAsync (do
+       x <- wait startup_handle
+       atomically (switchToRunning state_box)
+       action x) $ \server -> do
+    k8s_server <- async $ runK8sServiceEndpoint port maxTearDownPeriodSeconds k8s state_box server
+    (do result <- atomically $ asum
+          [ fmap void $ waitCatchSTM server
+          , readTVar state_box >>= \case
+              ApplicationTearingDown -> pure $ Right ()
+              _ -> retry
+          ]
+        case result of
+          Left se
+            | Just (_ :: AsyncCancelled) <- fromException se -> pure ()
+            | Just (_ :: AsyncException) <- fromException se -> pure ()
+            | otherwise -> throwIO se
+          Right{} -> pure ()
+        ) `finally`
+            (let half_interval = maxTearDownPeriodSeconds * 1_000_000 `div` 2
+             in race_ (threadDelay half_interval) (cancel server))
+          `finally`
+            (forkIO (cancel k8s_server))
+
+-- | Run server with k8s endpoint.
+--
+-- This endpoint provides k8s hooks:
+--   1. start
+--   2. liveness
+--   3. readyness
+--   4. pre_stop handler
+-- 
+-- All other endpoints returns 404.
+runK8sServiceEndpoint
+  :: Int -- ^ Port
+  -> Int -- ^ Shutdown interval
+  -> K8sChecks -- ^ K8s hooks
+  -> TVar ApplicationState -- ^ Projection of the application state
+  -> Async void -- ^ Handle of the running user code
+  -> IO ()
+runK8sServiceEndpoint port teardown_time_seconds K8sChecks{..} state_box server = Warp.run port $ \req resp -> do
+  case Wai.pathInfo req of
+    ["started"] -> do
+      readTVarIO state_box >>= \case
+        ApplicationStarting{} ->
+          resp $ responseLBS status400 [(hContentType, "text/plain")] "starting"
+        ApplicationRunning{} ->
+          resp $ responseLBS status200 [(hContentType, "text/plain")] "ok"
+        _ -> 
+          resp $ responseLBS status200 [(hContentType, "text/plain")] "tearing down"
+    ["ready"] -> do
+      readTVarIO state_box >>= \case
+        ApplicationStarting{} -> 
+          resp $ responseLBS status400 [(hContentType, "text/plain")] "starting"
+        ApplicationRunning{} -> do
+          isReady   <- runReadynessCheck
+          if isReady
+          then resp $ responseLBS status200 [(hContentType, "text/plain")] "running"
+          else resp $ responseLBS status400 [(hContentType, "text/plain")] "not running"
+        ApplicationTeardownConfirm confirmed -> do
+          atomically $ writeTVar confirmed True
+          resp $ responseLBS status400 [(hContentType, "text/plain")] "tearing down"
+        ApplicationTearingDown{} ->
+          resp $ responseLBS status400 [(hContentType, "text/plain")] "tearing down"
+    ["health"] -> do
+      readTVarIO state_box >>= \case
+        ApplicationStarting{} -> 
+          resp $ responseLBS status400 [(hContentType, "text/plain")] "starting"
+        _ -> do
+          isAlive <- runLivenessCheck 
+          -- TODO: is thread ok?
+          if isAlive
+          then resp $ responseLBS status200 [(hContentType, "text/plain")] "running"
+          else resp $ responseLBS status400 [(hContentType, "text/plain")] "unhealthy"
+    ["stop"]  -> do
+      _ <- async $ do
+        d <- registerDelay (teardown_time_seconds * 1_000_000)
+        join $ atomically $ switchToTeardown d state_box
+        -- this is interruptible, and waits until user thread will receive an
+        -- exception, but does not wait for the tearing down.
+        killThread $ asyncThreadId server
+      resp $ responseLBS status200 [(hContentType, "text/plain")] "tearing down"
+    ["_metrics"] -> metricsApp req resp
+    -- If it's any other path then we simply return 404
+    _ -> resp $ Wai.responseLBS status404 [(hContentType, "text/plain")] "Not found"
     
 -- | Switches the application to the tearing down state.
 -- 
@@ -220,21 +304,25 @@ withK8sEndpoint Config{..} K8sChecks{..} startup action = do
 -- timeout period
 switchToTeardown :: TVar Bool -> TVar ApplicationState -> STM (IO ())
 switchToTeardown timeout state = readTVar state >>= \case
-    ApplicationStarting{} -> do
+    ApplicationStarting init_thread -> do
       writeTVar state ApplicationTearingDown
-      pure $ pure ()
+      pure $ cancel init_thread 
     ApplicationRunning{} -> do
       confirmed <- newTVar False
       writeTVar state $ ApplicationTeardownConfirm confirmed
-      pure $ atomically $ asum
-       [ readTVar confirmed >>= check
-       , readTVar timeout >>= check
-       ]
+      pure $ do
+        atomically $ asum
+         [ readTVar confirmed >>= check
+         , readTVar timeout >>= check
+         ]
+        atomically $ writeTVar state ApplicationTearingDown
     ApplicationTeardownConfirm confirmed -> do
-      pure $ atomically $ asum
-        [ readTVar confirmed >>= check
-        , readTVar timeout >>= check
-        ]
+      pure $ do
+        atomically $ asum
+          [ readTVar confirmed >>= check
+          , readTVar timeout >>= check
+          ]
+        atomically $ writeTVar state ApplicationTearingDown
     ApplicationTearingDown -> 
       pure $ pure ()
 
