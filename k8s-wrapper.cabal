@@ -15,11 +15,12 @@ bug-reports:        https://github.com/cheopslab/k8s-wrapper/issues
 license:            MPL-2.0
 license-file:       LICENSE
 author:             Alexander Vershilov
-maintainer:         alexander.vershilov@sirius.online
+maintainer:         alexander.vershilov@sirius.online, backend-dev@sirius.online
 category:           Network
 extra-source-files:
   CHANGELOG.md
   spec.yaml
+  Readme.md
 tested-with: GHC==9.2.2, GHC==9.0.2, GHC==8.10.7
 
 library
@@ -43,9 +44,8 @@ library
         warp
     hs-source-dirs:   src
     default-language: Haskell2010
-    ghc-options: -Wall -Werror -Wextra
+    ghc-options: -Wall -Wextra
 
-This test suite does not work in GitHub actions
 test-suite k8s-wrapper-test
     default-language: Haskell2010
     type:             exitcode-stdio-1.0

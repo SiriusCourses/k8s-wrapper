@@ -1,4 +1,4 @@
-k8s-wrapper is a [wai]() application that is designed to wrap your service running in a k8s
+k8s-wrapper is a [wai](https://hackage.haskell.org/package/wai) application that is designed to wrap your service running in a k8s
 environment and provide the additional functionality needed for a fully-featured application
 to operate. It accomplishes it in several ways:
 
@@ -22,7 +22,7 @@ In order to use k8s application you should do:
 
 ```cabal
 executable mega-service
-  build-depends: base >= 5.0,
+  build-depends: base >= 4.4,
     k8s-wrapper,
     ...
   ...
@@ -67,6 +67,8 @@ that provides endpoints:
    - **/started** — provides information if application is started
    - **/ready** — provides information if application can accept the traffic
    - **/health** — provides information if application is healthy
+   - **/stop** — preStop hook — requests application teardown
+   - `/_metrics` - output metrics for the application
   
 For the machine readable format you can check `spec.yaml` file provided with the package
 that provides openapi v3 definition of the endpoints.
