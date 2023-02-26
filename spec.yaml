@@ -1,0 +1,124 @@
+openapi: 3.0.3
+info:
+  title: Management control interface
+  description: Service management interface
+  version: 0.0.1
+paths:
+  /started:
+    get:
+      summary: Application startup state.
+      description: |-
+        Returns information if the application is already started or not.
+      responses:
+        '200':
+          description: Application is in an operating state
+          content:
+            text/plain:
+              schema: 
+                oneOf:
+                  - $ref: "#/components/schemas/Ok"
+                  - $ref: "#/components/schemas/TearingDown"
+        '400':
+          description: Application is in a starting state
+          content:
+            text/plain:
+              schema: 
+                oneOf:
+                  - $ref: "#/components/schemas/Starting"
+
+  /ready:
+    get:
+      summary: Application readiness state.
+      description: |-
+        Tells if the k8s can route the traffic to this application. K8s periodically checks this
+        endpoint in order to understand if it can route traffic there.
+      responses:
+        '200':
+          description: Application is in an operating state
+          content:
+            text/plain:
+              schema: 
+                oneOf:
+                  - $ref: "#/components/schemas/Running"
+        '400':
+          description: Application is in a starting state
+          content:
+            text/plain:
+              schema: 
+                oneOf:
+                - $ref: "#/components/schemas/Starting"
+                - $ref: "#/components/schemas/NotRunning"
+                - $ref: "#/components/schemas/TearingDown"
+  /health:
+    get:
+      summary: Application liveness state.
+      description: |-
+        Tells if the application is alive, if not k8s can restart this instance.
+      responses:
+        '200':
+          description: Application is in an operating state
+          content:
+            text/plain:
+              schema: 
+                oneOf:
+                  - $ref: "#/components/schemas/Running"
+        '400':
+          description: Application is in a starting state
+          content:
+            text/plain:
+              schema: 
+                oneOf:
+                - $ref: "#/components/schemas/Starting" 
+                - $ref: "#/components/schemas/Unhealthy"
+  /stop:
+    get:
+      summary: Request application teardown.
+      description: |-
+        Tells if to gracefully teardown, after being called the ready endpoint starts returning 400,
+        and no new traffic is accepted. All current requestes are processed.
+        
+        If users' appliction does not exit withing allowed timeout it's killed forcefully.
+      responses:
+        '200':
+          description: Application has accepted the teardown request 
+          content:
+            text/plain:
+              schema:
+                oneOf:
+                - $ref: "#/components/schemas/TearingDown"
+  /_metrics:
+    get:
+      summary: Output metrics in prometheus format
+      description: |-
+        Output all the metrics provided by the application
+      responses:
+        '200':
+           description: Metrics for the application
+           content:
+             text/plain:
+               schema:
+                 type: string
+
+components:
+  schemas:
+    Ok:
+      type: string
+      enum: ["ok"]
+      description: Application is working
+    Running:
+      type: string
+      enum: ["running"]
+      description: Application is running
+    NotRunning:
+      type: string
+      enum: ["not running"]
+      description: Application is not running
+    TearingDown:
+      enum: ["tearing down"]
+      description: Application is tearing down
+    Starting:
+      enum: ["starting"]
+      description: Application is starting
+    Unhealthy:
+      enum: ["unhealthy"]
+      description: Application is unhealthy

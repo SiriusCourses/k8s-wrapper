@@ -16,9 +16,11 @@ license:            MPL-2.0
 license-file:       LICENSE
 author:             Alexander Vershilov
 maintainer:         alexander.vershilov@sirius.online
-
 category:           Network
-extra-source-files: CHANGELOG.md
+extra-source-files:
+  CHANGELOG.md
+  spec.yaml
+tested-with: GHC==9.2.2, GHC==9.0.2, GHC==8.10.7
 
 library
     exposed-modules: 
@@ -28,11 +30,8 @@ library
       LambdaCase
       NumericUnderscores
       OverloadedStrings
-      ScopedTypeVariables
       RecordWildCards
-    -- other-modules:
-
-    -- other-extensions:
+      ScopedTypeVariables
     build-depends:
         base ^>=4.14.3.0,
         async ^>= 2.2.4,

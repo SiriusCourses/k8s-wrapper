@@ -1,25 +1,24 @@
--- | Wrapper for the k8s.
+-- | 
+-- = k8s-wrapper
 --
--- This is a wrapper that provides the interface for running the application
--- in the kubernetes system. This module spawns the server on internal protocol
--- that provides endpoints for starup, liveness and readyness checks as well
--- as optional metrics support.
+-- The k8s Wrapper is a module designed to provide an interface for running
+-- applications in the Kubernetes system. This wrapper spawns the server on an
+-- internal protocol, providing endpoints for startup, liveness, and
+-- readiness checks, as well as optional metrics support.
+--
+-- There are some restrictions to be aware of when using this module.
+-- First, the **server must be running in the main thread** in order to exit properly.
+-- If this guarantee is not met, application and k8s will still function, but rollout
+-- update procedures may take much longer.
 -- 
--- Restrictions:
+-- Second, the user's application must be able to tear down upon receiving
+-- `AsyncCancelled` or `ThreadKilled` signals. While it's acceptable to implement
+-- graceful teardowns, these should be time-bound. In general, applications that use
+-- Warp handles this automatically.
 --
---   * In order to work propertly the server should be running in the main thread,
---     otherwise we can't guarantee that the server will exit properly. In absence
---     of this guarantee application and k8s will still work, but rollout update
---     procedures may take much longer.
+-- To use the k8s Wrapper, include the following configuration snippet in your pod:
 --
---   * User application should be able to teardown on receiving AsyncCancelled or
---      ThreadKilled, it's should be ok, to implement graceful teardown, but it
---      should be bounded by the time.
---     In general applications that are using Warp handles this well automatically.
---
---
--- Here is a part of the pod configuration that can be used with this wrapper.
---
+-- == __pod.yaml__
 -- @
 -- ...
 -- spec:
@@ -93,10 +92,10 @@ import Network.Wai as Wai
 import Network.Wai.Handler.Warp qualified             as Warp
 import Network.Wai.Middleware.Prometheus    as Prometheus
 
--- | Server configuration
+-- | Server configuration.
 data Config = Config
-  { port :: Int 
-  , maxTearDownPeriodSeconds :: Int
+  { port :: Int  -- ^ Port where control interface is statred.
+  , maxTearDownPeriodSeconds :: Int -- ^ How much time to wait before forceful teardown.
   } deriving (Show)
 
 -- | Default configuration variables.
@@ -105,34 +104,27 @@ defConfig = Config 10120 30
 
 -- $k8s-checks
 -- 
--- There can be two types of the health check:
+-- There are two types of health checks that can be used:
 --
---   1. deep check - the check that not only ensures basic startup, but verifies
---        that the services that our service communicates are up and running.
+--  1. __Deep check__ - this verifies not only basic startup but also that the services
+--     the application communicates with are up and running. It is more precise, but it increases
+--     the risk of marking services as unavailable and causing cascading errors. Therefore,
+--     it is recommended to use deep checks for the `startupCheck`, but use shallow checks for the `livenessCheck`.
+--     As for the `readinessCheck`, it is up to the user to decide which type of check to use.
+--  2. __Shallow check__ - this provides only the basic tests to ensure the application is running.
 --
---   2. shallow check - the check that provides only the basic tests that application
---        is running.
+-- The suggested approach for implementing the health checks is as follows:
 -- 
--- The deep check is more precise but it increases the chances that interim error
--- will lead to marking services as unavailable and lead to a cascading errors in
--- the end. So it's adviced to use deep checks in the 'startupCheck', but use shallow check
--- for liveness check, as for the readyness check it's up to the user.
---
--- The library authors suggest the following approach.
--- 
---   1. 'startupCheck' returns true after the server is started configs were checked and
---       communication with other services was established. After replying with 'True' once
---       the function always returns 'True'. 
---
---   2. 'readynessCheck' should return 'True' after startup check has passed and after population
---       of the caches, preparing of the internal structures and so on. The function may switch
---       back to 'False' in case if the structures needs repopulation and we can't serve the users.
---       It's important to ensure that all the services in cluster will not switch to not ready
---       state at the same time to avoid cascading failures.
---
---   3. 'livenessCheck' performs shallow check of the service, and returns the state accordingly,
---       generally the livenessCheck should return 'False' only in the case if the server should be
---       restarted.
+--  1. The `startupCheck` should return @True@ after the server is started, configs were checked,
+--     and communication with other services was established. Once it has returned @True@, the
+--     function should always return @True@.
+--  2. The `readinessCheck` should return @True@ after the startup check has passed and after
+--     population of the caches, preparing of the internal structures, etc. The function may
+--     switch back to @False@ if the structures need repopulation and the application
+--     can't serve the users. It's important to ensure that all the services in the cluster will
+--     not switch to not ready state at the same time to avoid cascading failures.
+--  3. The `livenessCheck` performs a shallow check of the service and returns the state accordingly.
+--     Generally, the `livenessCheck` should return @False@ only in the case where the server needs to be restarted.
 
 -- | Callbacks that the wrapper can use in order to understand the state of
 -- the application and react accordingly.
@@ -149,8 +141,8 @@ data ApplicationState
   | ApplicationTearingDown
   
 
--- | Wrap a server that allows controlling business logic server. The server can be
--- communicated by the k8s services and can monitor the application livecycle.
+-- | Wrap a server that allows controlling business logic server.
+-- The server can be communicated by the k8s services and can monitor the application livecycle.
 --
 -- In the application run the following logic:
 --
@@ -172,31 +164,27 @@ data ApplicationState
 -- @
 --             
 -- 
--- In addition to the callbacks that the server is running it provides some additional
--- logic:
+-- The server wrapper also provides additional logic:
+--   1. When checking liveness, the code checks if the thread running the server is still
+--      alive and returns @False@ if it is not, regardless of what liveness check returns.
+--   2. When the `stop` action is called, the server starts to return @False@ in the readiness check.
+--      Once it is asked by the server, it sends an Exception to the client code.
+--      This ensures that no new requests will be sent to the server.
 --
---   1. when checking the liveness the code checks if the thread running the server is
---      still alive and returns 'False' if not, not matter what liveness check returns.
+-- In case of an asynchronous exception, we expect that we want to terminate the program.
+-- Thus, we want to ensure a similar set of actions as a call to the @/stop@ hook:
 --
---   2. when 'stop' action was called, the server starts to return 'False' in readyness
---      check, and once it was asked by the server it sends an Exception to the client
---      code. It ensures that no new requests will be sent to the server.
+--   1.  Put the application in the tearing down state.
+--   2.  Start replying with @ready=False@ replies.
+--   3.  Once we replied with @ready=false@ at least once (or after a timeout), we trigger server stop.
+--      In this place, we expect the server to stop accepting new connections and exit once all
+--      current connections will be processed. This is the responsibility of the function provided by the user,
+--      but servers like Warp already handle that properly.
 --
--- In case of asynchronous exception, we expect that we want to terminate the program,
--- so we want to ensure the similar set of actions as call to /stop hook:
+-- In case of an exception in the initialization function, it will be rethrown, and the function will exit with the same exception.
+-- The k8s endpoint will be torn down.
 --
---   1. We put application in the tearingdown state
---   2. We start replying with ready=false replies
---   3. Once we replies with ready=false once (or after a timeout) we trigger server stop.
---      In this place we expect the server to stop accepting new connections, and exit
---      once all current connections will be processed. This is the responcibility of the
---      function provided by the user, but servers like Warp already handles that properly. 
---
--- In case of an exception in the initialization function it will be rethrown, code
--- the function will exit with the same exception, k8s endpoint will be teared down.
---
--- In case if the user code exists with an exception it will be rethrown, otherwise the
--- code exits properly.
+-- In case if the user code exists with an exception, it will be rethrown. Otherwise, the code exits properly.
 withK8sEndpoint
   :: Config      -- ^ Static configuration of the endpoint.
   -> K8sChecks   -- ^ K8s hooks
