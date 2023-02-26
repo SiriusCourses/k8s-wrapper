@@ -89,8 +89,8 @@ import Control.Monad
 import Data.Foldable
 import Network.HTTP.Types
 import Network.Wai as Wai
-import Network.Wai.Handler.Warp qualified             as Warp
-import Network.Wai.Middleware.Prometheus    as Prometheus
+import Network.Wai.Handler.Warp qualified as Warp
+import Network.Wai.Middleware.Prometheus as Prometheus
 
 -- | Server configuration.
 data Config = Config

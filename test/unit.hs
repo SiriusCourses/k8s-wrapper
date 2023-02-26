@@ -18,17 +18,17 @@ main = defaultMain tests
 
 isAlive, isReady, isStarted :: Manager -> IO Bool
 isAlive manager =
-  let req = "http://localhost:10120/health"
+  let req = "http://127.0.0.1:10120/health"
   in httpNoBody req manager <&> (==200) . statusCode . responseStatus   
 isReady manager = 
-  let req = "http://localhost:10120/ready"
+  let req = "http://127.0.0.1:10120/ready"
   in httpNoBody req manager <&> (==200) . statusCode . responseStatus   
 isStarted manager =
-  let req = "http://localhost:10120/started"
+  let req = "http://127.0.0.1:10120/started"
   in httpNoBody req manager <&> (==200) . statusCode . responseStatus   
 stopIt :: Manager -> IO ()
 stopIt manager =
-  let req = "http://localhost:10120/stop"
+  let req = "http://127.0.0.1:10120/stop"
   in void $ httpNoBody req manager
 
 tests :: TestTree
