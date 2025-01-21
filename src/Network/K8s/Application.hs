@@ -131,6 +131,7 @@ defConfig = Config 10120 30
 data K8sChecks = K8sChecks
   { runReadynessCheck :: IO Bool -- ^ Checks that application can receive requests
   , runLivenessCheck :: IO Bool  -- ^ Checks that application running (should not be restarted)
+  , internalLogic :: Maybe Application -- ^ Internal application logic to run
   }
 
 -- | Application state.
@@ -278,8 +279,11 @@ runK8sServiceEndpoint port teardown_time_seconds K8sChecks{..} state_box server 
         killThread $ asyncThreadId server
       resp $ responseLBS status200 [(hContentType, "text/plain")] "tearing down"
     ["_metrics"] -> metricsApp req resp
-    -- If it's any other path then we simply return 404
-    _ -> resp $ Wai.responseLBS status404 [(hContentType, "text/plain")] "Not found"
+    _ -> case internalLogic of
+      -- If it's any other path then we simply return 404
+      Nothing -> resp $ Wai.responseLBS status404 [(hContentType, "text/plain")] "Not found"
+      -- If internal logic set - run it
+      Just application -> application req resp
     
 -- | Switches the application to the tearing down state.
 -- 
